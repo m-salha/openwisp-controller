@@ -68,6 +68,12 @@ url_metadata = [
         "app": "openwisp_controller.connection",
         "include": {"module": "{app}.api.urls", "namespace": "connection_api"},
     },
+    # openwisp_controller.provisioning
+    {
+        "regexp": "",
+        "app": "openwisp_controller.provisioning",
+        "include": {"module": "{app}.api.urls", "namespace": "provisioning_api"},
+    },
 ]
 
 urlpatterns = []
