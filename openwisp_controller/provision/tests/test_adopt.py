@@ -167,7 +167,10 @@ class TestAdoptView(TestOrganizationMixin, TestCase):
         response = self.client.get(ADOPT_URL)
         self.assertEqual(response.status_code, 405)
 
-    def test_adopt_existing_device_other_org_not_overwritten(self):
+    def test_adopt_rejects_when_mac_owned_by_other_org(self):
+        """A MAC already claimed by another organization must yield 403,
+        must NOT leak the token org's shared_secret, must leave the
+        existing device untouched, and must NOT consume a token slot."""
         org1 = self._create_org_with_settings(name="org-one", slug="org-one")
         org2 = self._create_org_with_settings(name="org-two", slug="org-two")
         Device.objects.create(
@@ -175,11 +178,93 @@ class TestAdoptView(TestOrganizationMixin, TestCase):
         )
         token = self._create_token(organization=org2)
         response = self._post(self._payload(token))
-        # adoption still succeeds (router still gets openwisp config),
-        # but the existing device is not moved between orgs
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 403)
+        body = response.json()
+        self.assertNotIn("openwisp", body)
+        self.assertNotIn("chilli", body)
+        # Defensive: the secret must not appear anywhere in the body.
+        self.assertNotIn(TEST_SHARED_SECRET, json.dumps(body))
+        # The existing device must not be moved between organizations.
         existing = Device.objects.get(mac_address=TEST_MAC)
         self.assertEqual(existing.organization_id, org1.id)
+        # The token must not be consumed.
+        token.refresh_from_db()
+        self.assertEqual(token.use_count, 0)
+        self.assertIsNone(token.last_used_at)
+
+    def test_adopt_max_uses_strict_under_sequential_requests(self):
+        """Sequential adoption requests must respect max_uses exactly:
+        use_count must never exceed the cap and the request that would
+        cross the cap must be rejected with 403."""
+        token = self._create_token(max_uses=2)
+        r1 = self._post(self._payload(token))
+        r2 = self._post(self._payload(token))
+        r3 = self._post(self._payload(token))
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r3.status_code, 403)
+        token.refresh_from_db()
+        self.assertEqual(token.use_count, 2)
+
+    def test_adopt_max_uses_safe_under_simulated_race(self):
+        """If a competing increment lands between is_usable() and the
+        conditional UPDATE, the UPDATE must affect zero rows, the
+        transaction must roll back (no device row created, no
+        use_count overshoot), and the caller must get 403."""
+        from unittest.mock import patch
+
+        token = self._create_token(max_uses=1)
+        real_filter = AdoptionToken.objects.filter
+
+        def filter_with_concurrent_bump(*args, **kwargs):
+            qs = real_filter(*args, **kwargs)
+            # Only intercept the conditional update filter
+            # (use_count__lt is only used by the increment call).
+            if "use_count__lt" in kwargs:
+                # Simulate a concurrent adoption that consumed the slot
+                # after our is_usable() check but before our UPDATE.
+                AdoptionToken.objects.filter(pk=token.pk).update(
+                    use_count=token.max_uses
+                )
+            return qs
+
+        with patch.object(
+            AdoptionToken.objects,
+            "filter",
+            side_effect=filter_with_concurrent_bump,
+        ):
+            response = self._post(self._payload(token))
+
+        self.assertEqual(response.status_code, 403)
+        body = response.json()
+        self.assertNotIn("openwisp", body)
+        token.refresh_from_db()
+        # use_count is exactly max_uses — neither short nor over.
+        self.assertEqual(token.use_count, token.max_uses)
+        # The would-be device pre-registration must have been rolled
+        # back along with the transaction.
+        self.assertFalse(
+            Device.objects.filter(mac_address=TEST_MAC).exists()
+        )
+
+    def test_adopt_uses_select_for_update_on_token(self):
+        """The token lookup inside the critical section must use
+        select_for_update so that, on backends that honour it, the
+        token row is locked while we validate and bump use_count."""
+        from unittest.mock import patch
+
+        token = self._create_token()
+        manager_cls = type(AdoptionToken.objects)
+        original = manager_cls.select_for_update
+        with patch.object(
+            manager_cls,
+            "select_for_update",
+            autospec=True,
+            side_effect=lambda self, *a, **kw: original(self, *a, **kw),
+        ) as mock_sfu:
+            response = self._post(self._payload(token))
+        self.assertEqual(response.status_code, 200)
+        mock_sfu.assert_called()
 
 
 class TestSecretsNotLogged(TestOrganizationMixin, TestCase):

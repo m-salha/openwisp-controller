@@ -3,6 +3,7 @@ import logging
 import re
 
 from django.db import transaction
+from django.db.models import F
 from django.http import JsonResponse
 from django.urls import reverse
 from django.utils import timezone
@@ -63,6 +64,15 @@ class AdoptView(View):
         and (best-effort) MAC address are logged for traceability.
       * Validation failures return a generic error code; the reason is
         only included in logs.
+      * If the MAC is already claimed by a different organization the
+        request is rejected with HTTP 403 and the response does not
+        include the organization's shared_secret.
+      * The token usability check and the use_count increment run inside
+        a single transaction with a row-level lock (select_for_update),
+        and the increment itself is a conditional UPDATE guarded by an
+        F()-expression, so max_uses cannot be bypassed by concurrent
+        adoption requests even on backends where SELECT ... FOR UPDATE
+        is a no-op (e.g. SQLite).
     """
 
     http_method_names = ["post"]
@@ -95,48 +105,99 @@ class AdoptView(View):
             return _json_error("invalid mac_address", status=400)
         mac_address = mac_address.upper()
 
-        try:
-            token = AdoptionToken.objects.select_related("organization").get(
-                token=token_value
-            )
-        except AdoptionToken.DoesNotExist:
-            logger.warning(
-                "provision.adopt: unknown token (mac=%s)", mac_address
-            )
-            return _json_error("invalid token", status=403)
+        # Critical section: lock the token row, validate, claim a usage
+        # slot, and (best-effort) pre-register the device — all atomic.
+        with transaction.atomic():
+            try:
+                token = (
+                    AdoptionToken.objects.select_for_update()
+                    .select_related("organization")
+                    .get(token=token_value)
+                )
+            except AdoptionToken.DoesNotExist:
+                logger.warning(
+                    "provision.adopt: unknown token (mac=%s)", mac_address
+                )
+                return _json_error("invalid token", status=403)
 
-        ok, reason = token.is_usable()
-        if not ok:
-            logger.warning(
-                "provision.adopt: token %s not usable (%s, mac=%s)",
-                token.pk,
-                reason,
-                mac_address,
-            )
-            return _json_error("invalid token", status=403)
+            ok, reason = token.is_usable()
+            if not ok:
+                logger.warning(
+                    "provision.adopt: token %s not usable (%s, mac=%s)",
+                    token.pk,
+                    reason,
+                    mac_address,
+                )
+                return _json_error("invalid token", status=403)
 
-        organization = token.organization
-        try:
-            org_settings = OrganizationConfigSettings.objects.only(
-                "shared_secret"
-            ).get(organization=organization)
-        except OrganizationConfigSettings.DoesNotExist:
-            logger.error(
-                "provision.adopt: organization %s missing config_settings",
-                organization.pk,
-            )
-            return _json_error("configuration unavailable", status=503)
+            organization = token.organization
 
-        shared_secret = org_settings.shared_secret
-        if not shared_secret:
-            logger.error(
-                "provision.adopt: organization %s has empty shared_secret",
-                organization.pk,
+            # Cross-organization MAC ownership: must be checked BEFORE
+            # we touch the organization's shared_secret, so a router
+            # whose MAC is already claimed by another tenant cannot
+            # extract this tenant's secret by presenting a valid token.
+            mac_owner_org_id = (
+                Device.objects.filter(mac_address=mac_address)
+                .values_list("organization_id", flat=True)
+                .first()
             )
-            return _json_error("configuration unavailable", status=503)
+            if (
+                mac_owner_org_id is not None
+                and mac_owner_org_id != organization.id
+            ):
+                logger.warning(
+                    "provision.adopt: mac %s already owned by org %s "
+                    "(token org %s)",
+                    mac_address,
+                    mac_owner_org_id,
+                    organization.id,
+                )
+                return _json_error(
+                    "mac address already claimed", status=403
+                )
 
-        self._register_device(token, organization, mac_address, payload)
-        self._mark_used(token, mac_address)
+            try:
+                org_settings = OrganizationConfigSettings.objects.only(
+                    "shared_secret"
+                ).get(organization=organization)
+            except OrganizationConfigSettings.DoesNotExist:
+                logger.error(
+                    "provision.adopt: organization %s missing config_settings",
+                    organization.pk,
+                )
+                return _json_error("configuration unavailable", status=503)
+
+            shared_secret = org_settings.shared_secret
+            if not shared_secret:
+                logger.error(
+                    "provision.adopt: organization %s has empty shared_secret",
+                    organization.pk,
+                )
+                return _json_error("configuration unavailable", status=503)
+
+            # Atomic compare-and-set on use_count. Even on backends
+            # where select_for_update is a no-op, the conditional UPDATE
+            # below guarantees max_uses cannot be exceeded: only the
+            # first concurrent caller below the cap will see rows == 1.
+            update_filters = {"pk": token.pk}
+            if token.max_uses is not None:
+                update_filters["use_count__lt"] = token.max_uses
+            rows = AdoptionToken.objects.filter(**update_filters).update(
+                use_count=F("use_count") + 1,
+                last_used_at=timezone.now(),
+                last_used_mac=mac_address,
+            )
+            if rows == 0:
+                logger.warning(
+                    "provision.adopt: token %s lost concurrent slot (mac=%s)",
+                    token.pk,
+                    mac_address,
+                )
+                transaction.set_rollback(True)
+                return _json_error("invalid token", status=403)
+
+            # We hold the slot — safe to persist the device row.
+            self._register_device(organization, mac_address, payload)
 
         openwisp_url = _resolve_openwisp_url(request)
         response_body = {
@@ -155,24 +216,17 @@ class AdoptView(View):
         )
         return JsonResponse(response_body, status=200)
 
-    def _register_device(self, token, organization, mac_address, payload):
+    def _register_device(self, organization, mac_address, payload):
         """
-        Best-effort: ensure a Device row exists for this MAC inside the
-        token's organization. Refuses if the MAC is already claimed by a
-        different organization. Failures here do not block the adoption
-        response (the router can still self-register via the existing
-        OpenWISP controller/register/ endpoint).
+        Best-effort: create a Device row for this MAC inside the token's
+        organization if one does not already exist. Cross-organization
+        ownership is rejected by the caller before this is invoked.
+        Failures here do not block the adoption response — the router
+        can still self-register via the existing controller/register/
+        endpoint.
         """
         try:
-            existing = Device.objects.filter(mac_address=mac_address).first()
-            if existing and existing.organization_id != organization.id:
-                logger.warning(
-                    "provision.adopt: mac %s already owned by org %s",
-                    mac_address,
-                    existing.organization_id,
-                )
-                return
-            if existing:
+            if Device.objects.filter(mac_address=mac_address).exists():
                 return
             hostname = (payload.get("hostname") or "").strip()
             model = (payload.get("model") or "").strip()
@@ -190,15 +244,6 @@ class AdoptView(View):
             logger.warning(
                 "provision.adopt: device pre-registration skipped (%s)",
                 exc.__class__.__name__,
-            )
-
-    @staticmethod
-    def _mark_used(token, mac_address):
-        with transaction.atomic():
-            AdoptionToken.objects.filter(pk=token.pk).update(
-                use_count=token.use_count + 1,
-                last_used_at=timezone.now(),
-                last_used_mac=mac_address,
             )
 
 
