@@ -68,6 +68,12 @@ url_metadata = [
         "app": "openwisp_controller.connection",
         "include": {"module": "{app}.api.urls", "namespace": "connection_api"},
     },
+    # openwisp_controller.provision (Lullex router adoption)
+    {
+        "regexp": "api/provision/",
+        "app": "openwisp_controller.provision",
+        "include": {"module": "{app}.urls", "namespace": "provision"},
+    },
 ]
 
 urlpatterns = []

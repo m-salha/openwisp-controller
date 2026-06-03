@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     "openwisp_controller.geo",
     "openwisp_controller.connection",
     "openwisp_controller.subnet_division",
+    "openwisp_controller.provision",
     "openwisp_notifications",
     "openwisp_ipam",
     # openwisp2 admin theme
