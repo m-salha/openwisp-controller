@@ -1,12 +1,14 @@
+import re
 import uuid
 
+import django.core.validators
 import django.db.models.deletion
 import django.utils.timezone
 import model_utils.fields
 import swapper
 from django.db import migrations, models
 
-import openwisp_utils.base
+import openwisp_utils.fields
 import openwisp_utils.utils
 
 
@@ -48,7 +50,7 @@ class Migration(migrations.Migration):
                 ),
                 (
                     "token",
-                    openwisp_utils.base.KeyField(
+                    openwisp_utils.fields.KeyField(
                         db_index=True,
                         default=openwisp_utils.utils.get_random_key,
                         help_text=(
@@ -57,7 +59,16 @@ class Migration(migrations.Migration):
                         ),
                         max_length=64,
                         unique=True,
-                        validators=[],
+                        validators=[
+                            django.core.validators.RegexValidator(
+                                re.compile("^[^\\s/\\.]+$"),
+                                code="invalid",
+                                message=(
+                                    "This value must not contain spaces, "
+                                    "dots or slashes."
+                                ),
+                            )
+                        ],
                         verbose_name="token",
                     ),
                 ),
