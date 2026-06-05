@@ -69,8 +69,11 @@ url_metadata = [
         "include": {"module": "{app}.api.urls", "namespace": "connection_api"},
     },
     # openwisp_controller.provision (Lullex router adoption)
+    # NOTE: this is mounted under api/lullex/provision/ to avoid
+    # colliding with the unrelated `openwisp_provisioning` app, which
+    # ships its own /api/provision/adopt/ DRF view.
     {
-        "regexp": "api/provision/",
+        "regexp": "api/lullex/provision/",
         "app": "openwisp_controller.provision",
         "include": {"module": "{app}.urls", "namespace": "provision"},
     },

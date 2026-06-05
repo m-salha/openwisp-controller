@@ -41,7 +41,7 @@ def _resolve_openwisp_url(request):
 @method_decorator(csrf_exempt, name="dispatch")
 class AdoptView(View):
     """
-    POST /api/provision/adopt/
+    POST /api/lullex/provision/adopt/
 
     Request body (JSON):
         {

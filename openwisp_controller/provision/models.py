@@ -10,7 +10,8 @@ from . import settings as app_settings
 
 class AdoptionToken(TimeStampedEditableModel):
     """
-    Admin-managed token that a router presents at POST /api/provision/adopt/.
+    Admin-managed token that a router presents at
+    POST /api/lullex/provision/adopt/.
 
     A token is bound to one organization. On successful validation the
     controller returns:
@@ -39,7 +40,10 @@ class AdoptionToken(TimeStampedEditableModel):
     organization = models.ForeignKey(
         swapper.get_model_name("openwisp_users", "Organization"),
         verbose_name=_("organization"),
-        related_name="adoption_tokens",
+        # related_name is namespaced to avoid an E304/E305 reverse
+        # accessor clash with the unrelated openwisp_provisioning app,
+        # whose AdoptionToken.organization already uses "adoption_tokens".
+        related_name="lullex_adoption_tokens",
         on_delete=models.CASCADE,
     )
     is_active = models.BooleanField(_("active"), default=True)
