@@ -48,14 +48,16 @@ class TestAdoptView(TestOrganizationMixin, TestCase):
             ADOPT_URL, data=json.dumps(body), content_type="application/json"
         )
 
-    def _payload(self, token):
-        return {
+    def _payload(self, token, **overrides):
+        data = {
             "token": token.token,
             "mac_address": TEST_MAC,
             "hostname": "lullex-router-1",
             "model": "Lullex AP v1",
             "agent_version": "1.0.0",
         }
+        data.update(overrides)
+        return data
 
     # ---------- happy path ----------
     def test_adopt_success_full_chilli(self):
@@ -198,18 +200,107 @@ class TestAdoptView(TestOrganizationMixin, TestCase):
         self.assertIsNone(token.last_used_at)
 
     def test_adopt_max_uses_strict_under_sequential_requests(self):
-        """Sequential adoption requests must respect max_uses exactly:
-        use_count must never exceed the cap and the request that would
-        cross the cap must be rejected with 403."""
+        """max_uses counts unique MACs. Adopting three DISTINCT MACs
+        against a max_uses=2 token must allow the first two and reject
+        the third; use_count must end at exactly 2."""
         token = self._create_token(max_uses=2)
-        r1 = self._post(self._payload(token))
-        r2 = self._post(self._payload(token))
-        r3 = self._post(self._payload(token))
+        r1 = self._post(self._payload(token, mac_address="AA:BB:CC:DD:EE:01"))
+        r2 = self._post(self._payload(token, mac_address="AA:BB:CC:DD:EE:02"))
+        r3 = self._post(self._payload(token, mac_address="AA:BB:CC:DD:EE:03"))
         self.assertEqual(r1.status_code, 200)
         self.assertEqual(r2.status_code, 200)
         self.assertEqual(r3.status_code, 403)
         token.refresh_from_db()
         self.assertEqual(token.use_count, 2)
+
+    # ---------- idempotent re-adoption ----------
+    def test_adopt_first_time_consumes_use_count(self):
+        """The first adoption of a MAC consumes exactly one slot."""
+        token = self._create_token(max_uses=5)
+        self.assertEqual(token.use_count, 0)
+        response = self._post(self._payload(token))
+        self.assertEqual(response.status_code, 200)
+        token.refresh_from_db()
+        self.assertEqual(token.use_count, 1)
+
+    def test_adopt_same_mac_reuse_does_not_consume_slot(self):
+        """Re-adoption by the same MAC must succeed without consuming
+        another use_count slot, no matter how many times it repeats."""
+        token = self._create_token(max_uses=5)
+        first = self._post(self._payload(token))
+        self.assertEqual(first.status_code, 200)
+        token.refresh_from_db()
+        self.assertEqual(token.use_count, 1)
+        for _ in range(3):
+            again = self._post(self._payload(token))
+            self.assertEqual(again.status_code, 200)
+        token.refresh_from_db()
+        self.assertEqual(token.use_count, 1)
+        # Exactly one Device must exist for the MAC.
+        self.assertEqual(
+            Device.objects.filter(mac_address=TEST_MAC).count(), 1
+        )
+
+    def test_adopt_same_mac_reuse_returns_updated_chilli(self):
+        """Re-adoption must return the latest token values. A token that
+        starts with Chilli disabled and is later given RADIUS/UAM values
+        must hand the new chilli block to the re-adopting router, still
+        without consuming a second slot."""
+        token = self._create_token(
+            max_uses=5, radius_server="", radius_secret="", uam_server=""
+        )
+        first = self._post(self._payload(token))
+        self.assertEqual(first.status_code, 200)
+        chilli_before = first.json()["chilli"]
+        self.assertNotIn("radiusserver1", chilli_before)
+        self.assertNotIn("radiussecret", chilli_before)
+        self.assertNotIn("uamserver", chilli_before)
+        # Admin enables Chilli on the token (GUI change).
+        token.radius_server = "radius.example.com"
+        token.radius_secret = "r4d_secret"
+        token.uam_server = "https://login.wifi.lullex.com/login"
+        token.chilli_net = "10.10.0.0/24"
+        token.save()
+        # Same MAC re-adopts and must receive the new values.
+        second = self._post(self._payload(token))
+        self.assertEqual(second.status_code, 200)
+        chilli_after = second.json()["chilli"]
+        self.assertEqual(chilli_after["radiusserver1"], "radius.example.com")
+        self.assertEqual(chilli_after["radiussecret"], "r4d_secret")
+        self.assertEqual(
+            chilli_after["uamserver"], "https://login.wifi.lullex.com/login"
+        )
+        self.assertEqual(chilli_after["net"], "10.10.0.0/24")
+        token.refresh_from_db()
+        self.assertEqual(token.use_count, 1)
+
+    def test_adopt_new_mac_blocked_when_max_uses_reached(self):
+        """Once max_uses is reached a NEW MAC is rejected, but the
+        already-adopted MAC may keep re-adopting."""
+        token = self._create_token(max_uses=1)
+        adopted = self._post(
+            self._payload(token, mac_address="AA:BB:CC:DD:EE:01")
+        )
+        self.assertEqual(adopted.status_code, 200)
+        token.refresh_from_db()
+        self.assertEqual(token.use_count, 1)
+        # A different/new MAC must be blocked now.
+        blocked = self._post(
+            self._payload(token, mac_address="AA:BB:CC:DD:EE:02")
+        )
+        self.assertEqual(blocked.status_code, 403)
+        self.assertFalse(
+            Device.objects.filter(mac_address="AA:BB:CC:DD:EE:02").exists()
+        )
+        token.refresh_from_db()
+        self.assertEqual(token.use_count, 1)
+        # The already-adopted MAC can still re-adopt.
+        reused = self._post(
+            self._payload(token, mac_address="AA:BB:CC:DD:EE:01")
+        )
+        self.assertEqual(reused.status_code, 200)
+        token.refresh_from_db()
+        self.assertEqual(token.use_count, 1)
 
     def test_adopt_max_uses_safe_under_simulated_race(self):
         """If a competing increment consumes the last slot between the
@@ -307,10 +398,16 @@ class TestSecretsNotLogged(TestOrganizationMixin, TestCase):
         with self.assertLogs(
             "openwisp_controller.provision.views", level="INFO"
         ) as cap:
+            # First adoption (new MAC) and a re-adoption (same MAC) must
+            # both keep secrets out of the logs.
             response = self.client.post(
                 ADOPT_URL, data=body, content_type="application/json"
             )
+            readopt = self.client.post(
+                ADOPT_URL, data=body, content_type="application/json"
+            )
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(readopt.status_code, 200)
         joined = "\n".join(cap.output)
         self.assertNotIn(token.token, joined)
         self.assertNotIn(TEST_SHARED_SECRET, joined)
