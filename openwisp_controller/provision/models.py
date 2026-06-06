@@ -10,7 +10,8 @@ from . import settings as app_settings
 
 class AdoptionToken(TimeStampedEditableModel):
     """
-    Admin-managed token that a router presents at POST /api/provision/adopt/.
+    Admin-managed token that a router presents at
+    POST /api/lullex/provision/adopt/.
 
     A token is bound to one organization. On successful validation the
     controller returns:
@@ -39,7 +40,10 @@ class AdoptionToken(TimeStampedEditableModel):
     organization = models.ForeignKey(
         swapper.get_model_name("openwisp_users", "Organization"),
         verbose_name=_("organization"),
-        related_name="adoption_tokens",
+        # related_name is namespaced to avoid an E304/E305 reverse
+        # accessor clash with the unrelated openwisp_provisioning app,
+        # whose AdoptionToken.organization already uses "adoption_tokens".
+        related_name="lullex_adoption_tokens",
         on_delete=models.CASCADE,
     )
     is_active = models.BooleanField(_("active"), default=True)
@@ -105,10 +109,17 @@ class AdoptionToken(TimeStampedEditableModel):
             return f"{self.description} ({self.organization})"
         return f"AdoptionToken {self.pk} ({self.organization})"
 
-    def is_usable(self):
+    def check_validity(self):
         """
-        Returns (ok: bool, reason: str). `reason` is a short, non-sensitive
-        code suitable for logging.
+        Non-quota validity checks: active, organization active, and not
+        expired. Returns (ok: bool, reason: str) where ``reason`` is a
+        short, non-sensitive code suitable for logging.
+
+        These checks apply to every adoption attempt, including the
+        idempotent re-adoption of a MAC that was already adopted. The
+        ``max_uses`` quota is intentionally NOT checked here so that an
+        already-adopted router is never blocked by the quota; see
+        ``is_usable`` for the full check used when a new slot is needed.
         """
         if not self.is_active:
             return False, "inactive"
@@ -116,6 +127,17 @@ class AdoptionToken(TimeStampedEditableModel):
             return False, "org_inactive"
         if self.expires_at and self.expires_at <= timezone.now():
             return False, "expired"
+        return True, ""
+
+    def is_usable(self):
+        """
+        Full usability check, including the ``max_uses`` quota. Used when
+        a brand-new usage slot is required (i.e. a MAC not yet adopted).
+        Returns (ok: bool, reason: str).
+        """
+        ok, reason = self.check_validity()
+        if not ok:
+            return ok, reason
         if self.max_uses is not None and self.use_count >= self.max_uses:
             return False, "max_uses_reached"
         return True, ""

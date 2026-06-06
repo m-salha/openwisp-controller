@@ -184,7 +184,7 @@ class Migration(migrations.Migration):
                     "organization",
                     models.ForeignKey(
                         on_delete=django.db.models.deletion.CASCADE,
-                        related_name="adoption_tokens",
+                        related_name="lullex_adoption_tokens",
                         to=swapper.get_model_name(
                             "openwisp_users", "Organization"
                         ),
