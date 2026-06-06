@@ -245,12 +245,32 @@ class TestAdoptView(TestOrganizationMixin, TestCase):
         """Re-adoption must return the latest token values. A token that
         starts with Chilli disabled and is later given RADIUS/UAM values
         must hand the new chilli block to the re-adopting router, still
-        without consuming a second slot."""
+        without consuming a second slot.
+
+        Setup invariant: the MAC used here must not already have a
+        Device row, otherwise the first POST would itself take the
+        idempotent path and not consume a slot. We use a MAC distinct
+        from TEST_MAC (which is exercised by other tests) and assert
+        the precondition explicitly.
+        """
         token = self._create_token(
             max_uses=5, radius_server="", radius_secret="", uam_server=""
         )
-        first = self._post(self._payload(token))
+        mac = "AA:BB:CC:DD:EE:5A"
+        # Precondition: no Device exists for this MAC yet, so the
+        # first POST goes down the new-adoption path and consumes one
+        # use_count slot.
+        self.assertFalse(Device.objects.filter(mac_address=mac).exists())
+
+        first = self._post(self._payload(token, mac_address=mac))
         self.assertEqual(first.status_code, 200)
+        # Checkpoint: confirm the first POST really was a new adoption.
+        token.refresh_from_db()
+        self.assertEqual(token.use_count, 1)
+        # The first POST should have created the Device row that the
+        # second POST will use to enter the idempotent re-adoption path.
+        self.assertTrue(Device.objects.filter(mac_address=mac).exists())
+
         chilli_before = first.json()["chilli"]
         self.assertNotIn("radiusserver1", chilli_before)
         self.assertNotIn("radiussecret", chilli_before)
@@ -261,8 +281,9 @@ class TestAdoptView(TestOrganizationMixin, TestCase):
         token.uam_server = "https://login.wifi.lullex.com/login"
         token.chilli_net = "10.10.0.0/24"
         token.save()
-        # Same MAC re-adopts and must receive the new values.
-        second = self._post(self._payload(token))
+        # Same MAC re-adopts: the Device row from the first POST drives
+        # the idempotent path, so use_count must NOT change.
+        second = self._post(self._payload(token, mac_address=mac))
         self.assertEqual(second.status_code, 200)
         chilli_after = second.json()["chilli"]
         self.assertEqual(chilli_after["radiusserver1"], "radius.example.com")
