@@ -124,24 +124,51 @@ class TestAdoptProvisioningState(ProvisionTestMixin, TestCase):
         self.assertIsNotNone(state.last_adopted_at)
 
     def test_readoption_updates_applied_revision_after_change(self):
+        """First adoption with a fresh MAC consumes exactly one
+        use_count slot; after a revision bump, re-adoption by the same
+        MAC carries the new applied_revision but does NOT consume
+        another slot.
+
+        Setup invariant: the MAC used here must not already have a
+        Device row, otherwise the first POST would itself take the
+        idempotent path. We use a MAC distinct from TEST_MAC (which is
+        exercised by other tests) and assert the precondition.
+        """
         token = self._create_token()
-        self._post(ADOPT_URL, token)
+        initial_use_count = token.use_count
+        mac = "AA:BB:CC:DD:EE:7B"
+        # Precondition: no Device exists for this MAC yet, so the first
+        # POST goes down the new-adoption path and consumes one slot.
+        self.assertFalse(Device.objects.filter(mac_address=mac).exists())
+
+        first = self._post(ADOPT_URL, token, mac_address=mac)
+        self.assertEqual(first.status_code, 200)
+        # Checkpoint: confirm the first POST really was a new adoption
+        # (use_count grew by exactly one, Device row was created).
+        token.refresh_from_db()
+        self.assertEqual(token.use_count, initial_use_count + 1)
+        self.assertTrue(Device.objects.filter(mac_address=mac).exists())
+
         state = AdoptionDeviceState.objects.get(
-            token=token, mac_address=TEST_MAC
+            token=token, mac_address=mac
         )
         self.assertEqual(state.applied_revision, 1)
+
         # Admin changes a RADIUS field -> revision bumps to 2.
         token.radius_server = "radius2.example.com"
         token.save()
         token.refresh_from_db()
         self.assertEqual(token.provisioning_revision, 2)
-        # Same MAC re-adopts: applied_revision catches up, use_count stays.
-        response = self._post(ADOPT_URL, token)
-        self.assertEqual(response.status_code, 200)
+
+        # Same MAC re-adopts: the Device created above drives the
+        # idempotent path, so applied_revision catches up but use_count
+        # must NOT increase.
+        second = self._post(ADOPT_URL, token, mac_address=mac)
+        self.assertEqual(second.status_code, 200)
         state.refresh_from_db()
         self.assertEqual(state.applied_revision, 2)
         token.refresh_from_db()
-        self.assertEqual(token.use_count, 1)
+        self.assertEqual(token.use_count, initial_use_count + 1)
 
     def test_adopt_idempotency_preserved_with_state(self):
         token = self._create_token(max_uses=5)
