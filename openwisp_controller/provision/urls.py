@@ -6,4 +6,5 @@ app_name = "provision"
 
 urlpatterns = [
     path("adopt/", views.adopt, name="adopt"),
+    path("check/", views.check, name="check"),
 ]
